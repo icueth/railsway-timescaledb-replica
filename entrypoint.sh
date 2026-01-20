@@ -192,7 +192,9 @@ fi
 
 # Auto-tuning
 if [ -f "$PG_CONF" ]; then
-    timescaledb-tune --quiet --yes --conf-path="$PG_CONF" --memory="${TS_TUNE_MEMORY:-1GB}" --cpus="${TS_TUNE_CORES:-1}"
+    # Fix permission denied on /tmp and skip backup to avoid tuning crash
+    chmod 777 /tmp
+    timescaledb-tune --quiet --yes --skip-backup --conf-path="$PG_CONF" --memory="${TS_TUNE_MEMORY:-1GB}" --cpus="${TS_TUNE_CORES:-1}"
     chown postgres:postgres "$PG_CONF"
 fi
 
