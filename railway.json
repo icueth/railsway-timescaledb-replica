@@ -7,54 +7,5 @@
     "deploy": {
         "numReplicas": 1,
         "restartPolicyType": "ON_FAILURE"
-    },
-    "services": {
-        "timescale-primary": {
-            "name": "timescale-primary",
-            "build": {
-                "dockerfilePath": "Dockerfile"
-            },
-            "variables": {
-                "NODE_ROLE": "PRIMARY",
-                "POSTGRES_PASSWORD": "${{shared.POSTGRES_PASSWORD}}",
-                "POSTGRES_USER": "postgres",
-                "POSTGRES_DB": "postgres",
-                "PGDATA": "/var/lib/postgresql/data/pgdata"
-            },
-            "volumes": {
-                "/var/lib/postgresql/data": {}
-            }
-        },
-        "timescale-replica": {
-            "name": "timescale-replica",
-            "build": {
-                "dockerfilePath": "Dockerfile"
-            },
-            "variables": {
-                "NODE_ROLE": "REPLICA",
-                "POSTGRES_PASSWORD": "${{shared.POSTGRES_PASSWORD}}",
-                "POSTGRES_USER": "postgres",
-                "POSTGRES_DB": "postgres",
-                "PRIMARY_HOST": "${{timescale-primary.RAILWAY_PRIVATE_DOMAIN}}",
-                "PGDATA": "/var/lib/postgresql/data/pgdata"
-            },
-            "volumes": {
-                "/var/lib/postgresql/data": {}
-            }
-        },
-        "timescale-proxy": {
-            "name": "timescale-proxy",
-            "build": {
-                "dockerfilePath": "Dockerfile.proxy"
-            },
-            "variables": {
-                "NODE_ROLE": "PROXY",
-                "POSTGRES_PASSWORD": "${{shared.POSTGRES_PASSWORD}}",
-                "POSTGRES_USER": "postgres",
-                "POSTGRES_DB": "postgres",
-                "PRIMARY_HOST": "${{timescale-primary.RAILWAY_PRIVATE_DOMAIN}}",
-                "REPLICA_HOST": "${{timescale-replica.RAILWAY_PRIVATE_DOMAIN}}"
-            }
-        }
     }
 }
