@@ -22,7 +22,8 @@
             "variables": {
                 "NODE_ROLE": "PRIMARY",
                 "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
-                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}"
+                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}",
+                "PGDATA": "/var/lib/postgresql/data/pgdata"
             },
             "volumes": {
                 "/var/lib/postgresql/data": {}
@@ -33,7 +34,8 @@
             "variables": {
                 "NODE_ROLE": "REPLICA",
                 "POSTGRES_PASSWORD": "${{POSTGRES_PASSWORD}}",
-                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}"
+                "PRIMARY_HOST": "${{ timescale-primary.RAILWAY_INTERNAL_HOSTNAME }}",
+                "PGDATA": "/var/lib/postgresql/data/pgdata"
             },
             "volumes": {
                 "/var/lib/postgresql/data": {}

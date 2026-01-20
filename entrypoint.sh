@@ -64,7 +64,7 @@ fi
 # -------------------------------------------------------------------------
 # DATABASE ROLES (PRIMARY/REPLICA)
 # -------------------------------------------------------------------------
-PG_DATA="/var/lib/postgresql/data"
+PG_DATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 PG_CONF="$PG_DATA/postgresql.conf"
 
 # Initialization for Primary (Maintenance Policies)
