@@ -1,5 +1,6 @@
 #!/bin/bash
-# 1. Force Log to stdout (Fix red logs in Railway)
+# Entrypoint for PRIMARY and REPLICA nodes only
+# For PROXY, use Dockerfile.proxy with entrypoint-proxy.sh
 exec 2>&1
 set -e
 
@@ -18,76 +19,6 @@ REPLICATION_USER="${REPLICATION_USER:-replicator}"
 
 log "Starting TimescaleDB HA Entrypoint..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER"
-
-# -------------------------------------------------------------------------
-# PROXY ROLE (Pgpool-II)
-# -------------------------------------------------------------------------
-if [ "$NODE_ROLE" = "PROXY" ]; then
-    log "Configuring Pgpool-II Proxy..."
-    mkdir -p /var/run/pgpool
-    chown -R postgres:postgres /var/run/pgpool || true
-
-    PGPOOL_CONF="/etc/pgpool.conf"
-    
-    # Escape single quotes in password for config safety
-    ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
-    
-    cat > "$PGPOOL_CONF" <<EOF
-listen_addresses = '*'
-port = 5432
-pcp_port = 9898
-backend_hostname0 = '$PRIMARY_HOST'
-backend_port0 = 5432
-backend_weight0 = 1
-backend_flag0 = 'ALLOW_TO_FAILOVER'
-
-backend_hostname1 = '$REPLICA_HOST'
-backend_port1 = 5432
-backend_weight1 = 1
-backend_flag1 = 'ALLOW_TO_FAILOVER'
-
-backend_clustering_mode = 'streaming_replication'
-load_balance_mode = on
-master_slave_sub_mode = 'stream'
-
-# Session handling for TimescaleDB compatibility
-statement_level_load_balance = on
-disable_load_balance_on_write = 'transaction'
-allow_sql_comments = on
-
-# Authentication: Pass-through
-enable_pool_hba = off
-pool_passwd = ''
-
-# Health Check & SR Check (Explicit database to fix status -2)
-health_check_period = 10
-health_check_timeout = 30
-health_check_user = '$POSTGRES_USER'
-health_check_password = '$ESCAPED_PASSWORD'
-health_check_database = '$POSTGRES_DB'
-auto_failback = on
-
-sr_check_period = 10
-sr_check_user = '$POSTGRES_USER'
-sr_check_password = '$ESCAPED_PASSWORD'
-sr_check_database = '$POSTGRES_DB'
-
-# Reduce log noise when replica is offline
-log_min_messages = warning
-
-num_init_children = 32
-max_pool = 4
-child_life_time = 300
-connection_life_time = 0
-client_idle_limit = 0
-EOF
-
-    log "Waiting for Primary ($PRIMARY_HOST)..."
-    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
-    
-    log "Launching Pgpool-II..."
-    exec pgpool -n -f "$PGPOOL_CONF" 2>&1
-fi
 
 # -------------------------------------------------------------------------
 # DATABASE ROLES (PRIMARY/REPLICA)

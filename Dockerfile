@@ -1,7 +1,7 @@
 FROM timescale/timescaledb:latest-pg17
 
-# Install useful tools, replication dependencies and Pgpool-II
-RUN apk add --no-cache bash sudo iputils wget curl pgpool
+# Install useful tools for replication (NO Pgpool - only for PRIMARY/REPLICA)
+RUN apk add --no-cache bash sudo iputils wget curl
 
 # Copy scripts
 COPY entrypoint.sh /usr/local/bin/entrypoint-custom.sh

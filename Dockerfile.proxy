@@ -1,0 +1,34 @@
+FROM debian:bookworm-slim
+
+# Install Pgpool-II 4.7 (supports channel_binding) and PostgreSQL client
+RUN apt-get update && apt-get install -y \
+    pgpool2 \
+    postgresql-client \
+    bash \
+    curl \
+    iputils-ping \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy scripts
+COPY entrypoint-proxy.sh /usr/local/bin/entrypoint-custom.sh
+COPY healthcheck-proxy.sh /usr/local/bin/healthcheck.sh
+
+# Make executable
+RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh
+
+# Create pgpool directories
+RUN mkdir -p /var/run/pgpool /var/log/pgpool && \
+    chown -R nobody:nogroup /var/run/pgpool /var/log/pgpool
+
+# Set environment defaults
+ENV POSTGRES_DB=postgres
+ENV POSTGRES_USER=postgres
+ENV REPLICATION_USER=replicator
+ENV NODE_ROLE=PROXY
+ENV TZ=Asia/Bangkok
+
+# Healthcheck
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-custom.sh"]
