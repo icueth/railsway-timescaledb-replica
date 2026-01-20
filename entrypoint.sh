@@ -166,24 +166,45 @@ EOF
     # --- ระบบ Auto-Repair (กรณี Volume ไม่ว่างและ Init scripts ไม่ทำงาน) ---
     (
         log "Primary: Starting background maintenance task..."
-        # รอจนกว่า Postgres จะพร้อมรับคำสั่ง SQL
-        until pg_isready -h localhost -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 2; done
+        # รอจนกว่า Postgres จะเปิด Unix Socket พร้อมรับคำสั่ง
+        until psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select 1" > /dev/null 2>&1; do 
+            sleep 2
+        done
         
-        export PGPASSWORD="$POSTGRES_PASSWORD"
+        log "Primary: Database is up via Unix Socket. Ensuring replication setup..."
         
-        log "Primary: Ensuring replication user and slot exist..."
-        psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN CREATE USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD'; END IF; END \$\$;"
-        psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM pg_create_physical_replication_slot('replica_slot') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');"
+        # 1. วนลูปสร้าง User รีพลิเคเตอร์จนกว่าจะสำเร็จ
+        while true; do
+            if psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1 FROM pg_roles WHERE rolname='$REPLICATION_USER'" | grep -q 1; then
+                log "Primary: Role '$REPLICATION_USER' exists."
+                break
+            fi
+            log "Primary: Creating replication user..."
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD';" > /dev/null 2>&1 && break
+            sleep 2
+        done
+
+        # 2. วนลูปสร้าง Replication Slot จนกว่าจะสำเร็จ
+        while true; do
+            if psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1 FROM pg_replication_slots WHERE slot_name='replica_slot'" | grep -q 1; then
+                log "Primary: Slot 'replica_slot' exists."
+                break
+            fi
+            log "Primary: Creating replication slot..."
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_create_physical_replication_slot('replica_slot');" > /dev/null 2>&1 && break
+            sleep 2
+        done
         
-        # ตรวจสอบและซ่อม pg_hba.conf
+        # 3. ตรวจสอบและซ่อม pg_hba.conf (ถ้ายังไม่มี)
         if ! grep -q "replication $REPLICATION_USER" "$PG_DATA/pg_hba.conf"; then
             log "Primary: Repairing pg_hba.conf..."
-            echo "host replication $REPLICATION_USER 0.0.0.0/0 md5" >> "$PG_DATA/pg_hba.conf"
-            echo "host all all 0.0.0.0/0 md5" >> "$PG_DATA/pg_hba.conf"
-            psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();"
+            # แทรกไว้บรรทัดบนสุดเพื่อให้มีผลก่อนกฎอื่นๆ
+            sed -i "1ihost replication $REPLICATION_USER 0.0.0.0/0 md5" "$PG_DATA/pg_hba.conf"
+            sed -i "1ihost all all 0.0.0.0/0 md5" "$PG_DATA/pg_hba.conf"
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();"
             log "Primary: Config reloaded successfully."
         fi
-        log "Primary: Maintenance task completed."
+        log "Primary: Maintenance task completed successfully."
     ) &
 fi
 
