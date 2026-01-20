@@ -11,7 +11,7 @@ NC='\033[0m'
 log() { echo -e "${GREEN}[Postgres-HA-$NODE_ROLE]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
-log "Booting PostgreSQL 17 HA Entrypoint..."
+log "Booting PostgreSQL 18 HA Entrypoint..."
 
 # -------------------------------------------------------------------------
 # PROXY ROLE (Pgpool-II)
@@ -77,7 +77,7 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
         log "Primary: Background maintenance started."
         until psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select 1" > /dev/null 2>&1; do sleep 3; done
         
-        log "Primary: Syncing passwords and replication slots..."
+        log "Primary: Syncing passwords, replication slots, and extensions..."
         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<EOSQL
             ALTER USER $POSTGRES_USER WITH PASSWORD '$POSTGRES_PASSWORD';
             DO \$\$ BEGIN
@@ -88,6 +88,10 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
                 END IF;
             END \$\$;
             SELECT * FROM pg_create_physical_replication_slot('replica_slot') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+            
+            -- Enable Extensions that require shared_preload_libraries
+            CREATE EXTENSION IF NOT EXISTS "pg_cron";
+            CREATE EXTENSION IF NOT EXISTS "pg_partman";
 EOSQL
         
         log "Primary: Applying failsafe pg_hba.conf..."
@@ -144,5 +148,5 @@ if [ -f "$PG_DATA/postgresql.conf" ]; then
     chown postgres:postgres "$PG_DATA/postgresql.conf"
 fi
 
-log "Starting PostgreSQL 17..."
+log "Starting PostgreSQL 18..."
 exec docker-entrypoint.sh postgres -c logging_collector=off 2>&1
