@@ -17,6 +17,7 @@ ENV TS_TUNE_MEMORY=2GB
 ENV TS_TUNE_CORES=2
 ENV REPLICATION_USER=replicator
 ENV NODE_ROLE=PRIMARY
+ENV TZ=Asia/Bangkok
 
 # Healthcheck
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh

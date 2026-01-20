@@ -32,6 +32,7 @@ ENV POSTGRES_DB=postgres
 ENV POSTGRES_USER=postgres
 ENV REPLICATION_USER=replicator
 ENV NODE_ROLE=PRIMARY
+ENV TZ=Asia/Bangkok
 
 # Healthcheck
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
