@@ -11,7 +11,13 @@ NC='\033[0m'
 log() { echo -e "${GREEN}[Postgres-HA-$NODE_ROLE]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
+# Default values for environment variables
+POSTGRES_USER="${POSTGRES_USER:-postgres}"
+POSTGRES_DB="${POSTGRES_DB:-postgres}"
+REPLICATION_USER="${REPLICATION_USER:-replicator}"
+
 log "Booting PostgreSQL 17 HA Entrypoint..."
+log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER"
 
 # -------------------------------------------------------------------------
 # PROXY ROLE (Pgpool-II)
@@ -22,6 +28,9 @@ if [ "$NODE_ROLE" = "PROXY" ]; then
     chown -R postgres:postgres /var/run/pgpool || true
 
     PGPOOL_CONF="/etc/pgpool.conf"
+    
+    # Escape single quotes in password for config safety
+    ESCAPED_PASSWORD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
     
     cat > "$PGPOOL_CONF" <<EOF
 listen_addresses = '*'
@@ -45,17 +54,17 @@ master_slave_sub_mode = 'stream'
 enable_pool_hba = off
 pool_passwd = ''
 
-# Health Check & SR Check
+# Health Check & SR Check (Explicit database to fix status -2)
 health_check_period = 10
 health_check_timeout = 30
 health_check_user = '$POSTGRES_USER'
-health_check_password = '$POSTGRES_PASSWORD'
+health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
 auto_failback = on
 
 sr_check_period = 10
 sr_check_user = '$POSTGRES_USER'
-sr_check_password = '$POSTGRES_PASSWORD'
+sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
 
 num_init_children = 32
@@ -76,7 +85,7 @@ PG_DATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 mkdir -p "$(dirname "$PG_DATA")"
 chown -R postgres:postgres /var/lib/postgresql/data
 
-# --- PRIMARY SETUP ---
+# --- PRIMARY SETUP WITH RESILIENCE ---
 if [ "$NODE_ROLE" = "PRIMARY" ]; then
     (
         set +e
@@ -86,26 +95,33 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
             if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
                 log "Primary: Server is ready. Running maintenance tasks..."
                 
-                psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-                     -v usr="$POSTGRES_USER" \
-                     -v pwd="$POSTGRES_PASSWORD" \
-                     -v r_usr="$REPLICATION_USER" \
-                     -v db_name="$POSTGRES_DB" <<-'EOSQL' 2>&1
-                    DO $$ 
-                    BEGIN
-                        EXECUTE format('ALTER USER %I WITH PASSWORD %L', :'usr', :'pwd');
-                        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = :'r_usr') THEN
-                            EXECUTE format('CREATE USER %I WITH REPLICATION PASSWORD %L', :'r_usr', :'pwd');
-                        ELSE
-                            EXECUTE format('ALTER USER %I WITH REPLICATION PASSWORD %L', :'r_usr', :'pwd');
-                        END IF;
-                    END $$;
+                # Escape single quotes in password for SQL safety
+                ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
+                
+                psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<EOSQL 2>&1
+-- Reload config first to ensure 'cron.database_name' is recognized
+SELECT pg_reload_conf();
 
-                    SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
-                    WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
-                    
-                    CREATE EXTENSION IF NOT EXISTS "pg_cron";
-                    CREATE EXTENSION IF NOT EXISTS "pg_partman";
+-- Sync main user password
+ALTER USER "$POSTGRES_USER" WITH PASSWORD '$ESCAPED_PWD';
+
+-- Ensure replication user exists
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN
+        CREATE USER "$REPLICATION_USER" WITH REPLICATION PASSWORD '$ESCAPED_PWD';
+    ELSE
+        ALTER USER "$REPLICATION_USER" WITH REPLICATION PASSWORD '$ESCAPED_PWD';
+    END IF;
+END \$\$;
+
+-- Replication Slot
+SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
+WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS "pg_cron";
+CREATE EXTENSION IF NOT EXISTS "pg_partman";
 EOSQL
 
                 if [ $? -eq 0 ]; then
@@ -126,7 +142,7 @@ EOF
                     log "Primary: Maintenance task completed."
                     break
                 else
-                    warn "Primary: SQL tasks failed, retrying in 5s..."
+                    warn "Primary: SQL tasks encountered an error (likely warming up), retrying in 5s..."
                 fi
             fi
             sleep 5
@@ -147,8 +163,14 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         done
         log "Replica: Sync complete."
     fi
-    printf "primary_conninfo = 'host=%s port=5432 user=%s password=%s'\n" "$PRIMARY_HOST" "$REPLICATION_USER" "$POSTGRES_PASSWORD" > "$PG_DATA/postgresql.auto.conf"
-    printf "primary_slot_name = 'replica_slot'\n" >> "$PG_DATA/postgresql.auto.conf"
+    
+    # APPEND to existing postgresql.auto.conf (don't overwrite!)
+    ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
+    
+    sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+    sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
+    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD'" >> "$PG_DATA/postgresql.auto.conf"
+    echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
     chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
 fi
 
@@ -159,7 +181,7 @@ if [ -f "$PG_DATA/postgresql.conf" ]; then
     sed -i "/^shared_preload_libraries/d" "$PG_DATA/postgresql.conf" || true
     echo "shared_preload_libraries = 'pg_stat_statements,pg_cron'" >> "$PG_DATA/postgresql.conf"
     sed -i "/^cron.database_name/d" "$PG_DATA/postgresql.conf" || true
-    echo "cron.database_name = '${POSTGRES_DB:-postgres}'" >> "$PG_DATA/postgresql.conf"
+    echo "cron.database_name = '$POSTGRES_DB'" >> "$PG_DATA/postgresql.conf"
     sed -i "/^password_encryption/d" "$PG_DATA/postgresql.conf" || true
     echo "password_encryption = scram-sha-256" >> "$PG_DATA/postgresql.conf"
     chown postgres:postgres "$PG_DATA/postgresql.conf"
