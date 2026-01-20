@@ -137,6 +137,7 @@ fi
 
 # 2. Logic สำหรับ PRIMARY
 if [ "$NODE_ROLE" = "PRIMARY" ]; then
+    # สร้าง Init scripts เผื่อไว้สำหรับการลบ Volume แล้วลงใหม่
     INIT_DIR="/docker-entrypoint-initdb.d"
     mkdir -p "$INIT_DIR"
     
@@ -147,13 +148,11 @@ echo "host replication $REPLICATION_USER 0.0.0.0/0 md5" >> "\$PGDATA/pg_hba.conf
 echo "host all all 0.0.0.0/0 md5" >> "\$PGDATA/pg_hba.conf"
 
 psql -v ON_ERROR_STOP=1 --username "\$POSTGRES_USER" --dbname "\$POSTGRES_DB" <<-EOSQL
-    DO \$\$
-    BEGIN
+    DO \$\$ BEGIN
         IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN
             CREATE USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD';
         END IF;
-    END
-    \$\$;
+    END \$\$;
     SELECT * FROM pg_create_physical_replication_slot('replica_slot') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
 EOSQL
 EOF
@@ -163,6 +162,29 @@ EOF
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 ALTER SYSTEM SET timescaledb.telemetry_level = 'off';
 EOF
+
+    # --- ระบบ Auto-Repair (กรณี Volume ไม่ว่างและ Init scripts ไม่ทำงาน) ---
+    (
+        log "Primary: Starting background maintenance task..."
+        # รอจนกว่า Postgres จะพร้อมรับคำสั่ง SQL
+        until pg_isready -h localhost -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 2; done
+        
+        export PGPASSWORD="$POSTGRES_PASSWORD"
+        
+        log "Primary: Ensuring replication user and slot exist..."
+        psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN CREATE USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD'; END IF; END \$\$;"
+        psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM pg_create_physical_replication_slot('replica_slot') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');"
+        
+        # ตรวจสอบและซ่อม pg_hba.conf
+        if ! grep -q "replication $REPLICATION_USER" "$PG_DATA/pg_hba.conf"; then
+            log "Primary: Repairing pg_hba.conf..."
+            echo "host replication $REPLICATION_USER 0.0.0.0/0 md5" >> "$PG_DATA/pg_hba.conf"
+            echo "host all all 0.0.0.0/0 md5" >> "$PG_DATA/pg_hba.conf"
+            psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();"
+            log "Primary: Config reloaded successfully."
+        fi
+        log "Primary: Maintenance task completed."
+    ) &
 fi
 
 # 3. Logic สำหรับ REPLICA (อดทนต่อการ Deploy พร้อมกัน)
