@@ -50,6 +50,11 @@ backend_clustering_mode = 'streaming_replication'
 load_balance_mode = on
 master_slave_sub_mode = 'stream'
 
+# Session handling for TimescaleDB compatibility
+statement_level_load_balance = on
+disable_load_balance_on_write = 'transaction'
+allow_sql_comments = on
+
 # Authentication: Pass-through
 enable_pool_hba = off
 pool_passwd = ''
@@ -72,6 +77,9 @@ log_min_messages = warning
 
 num_init_children = 32
 max_pool = 4
+child_life_time = 300
+connection_life_time = 0
+client_idle_limit = 0
 EOF
 
     log "Waiting for Primary ($PRIMARY_HOST)..."
