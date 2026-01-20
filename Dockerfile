@@ -1,12 +1,12 @@
 # Multi-role Dockerfile for TimescaleDB HA
 # Supports PRIMARY, REPLICA, and PROXY roles via NODE_ROLE environment variable
 
-# Stage 1: Build Pgpool 4.7 from source (for Alpine compatibility)
+# Stage 1: Build Pgpool 4.7 from source
 FROM alpine:3.20 AS pgpool-builder
 
 RUN apk add --no-cache \
     build-base \
-    postgresql17-dev \
+    postgresql-dev \
     linux-headers \
     openssl-dev \
     curl
