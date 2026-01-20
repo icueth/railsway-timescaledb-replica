@@ -53,7 +53,7 @@ sr_check_period = 10
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$POSTGRES_PASSWORD'
 
-num_init_children = 64
+num_init_children = 120
 max_pool = 4
 EOF
 
@@ -78,18 +78,18 @@ if [ "$NODE_ROLE" = "PRIMARY" ]; then
         until psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select 1" > /dev/null 2>&1; do sleep 3; done
         
         log "Primary: Syncing passwords, replication slots, and extensions..."
-        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<EOSQL
-            ALTER USER $POSTGRES_USER WITH PASSWORD '$POSTGRES_PASSWORD';
-            DO \$\$ BEGIN
-                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$REPLICATION_USER') THEN
-                    CREATE USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD';
+        export PGPASSWORD_SAFE="$POSTGRES_PASSWORD"
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
+            EXECUTE format('ALTER USER %I WITH PASSWORD %L', current_setting('custom.user'), current_setting('custom.pass'));
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = current_setting('custom.repl_user')) THEN
+                    EXECUTE format('CREATE USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
                 ELSE
-                    ALTER USER $REPLICATION_USER WITH REPLICATION PASSWORD '$POSTGRES_PASSWORD';
+                    EXECUTE format('ALTER USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
                 END IF;
-            END \$\$;
+            END $$;
             SELECT * FROM pg_create_physical_replication_slot('replica_slot') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
-            
-            -- Enable Extensions that require shared_preload_libraries
             CREATE EXTENSION IF NOT EXISTS "pg_cron";
             CREATE EXTENSION IF NOT EXISTS "pg_partman";
 EOSQL
@@ -98,10 +98,14 @@ EOSQL
         cat > "$PG_DATA/pg_hba.conf" <<EOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
+host    all             all             ::1/128                 trust
 host    all             all             10.0.0.0/8              trust
 host    all             all             100.64.0.0/10           trust
+host    all             all             fd00::/8                trust
 host    replication     all             0.0.0.0/0               scram-sha-256
+host    replication     all             ::/0                    scram-sha-256
 host    all             all             0.0.0.0/0               scram-sha-256
+host    all             all             ::/0                    scram-sha-256
 EOF
         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();"
         log "Primary: HA and Security configuration confirmed."
@@ -120,31 +124,25 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         done
         log "Replica: Base backup synced."
     fi
-    # Update connection info to handle password changes
-    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$POSTGRES_PASSWORD'" >> "$PG_DATA/postgresql.auto.conf"
-    echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
+    printf "primary_conninfo = 'host=%s port=5432 user=%s password=%s'\n" "$PRIMARY_HOST" "$REPLICATION_USER" "$POSTGRES_PASSWORD" >> "$PG_DATA/postgresql.auto.conf"
+    printf "primary_slot_name = 'replica_slot'\n" >> "$PG_DATA/postgresql.auto.conf"
     chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
 fi
 
 # Shared Config for all DB nodes
 if [ -f "$PG_DATA/postgresql.conf" ]; then
     log "Configuring PostgreSQL libraries and logging..."
-    # Force stdout logging
     sed -i "s/^logging_collector.*/logging_collector = off/" "$PG_DATA/postgresql.conf" || true
-    
-    # Configure shared libraries for extensions (pg_cron, etc.)
-    # Remove existing shared_preload_libraries and add our own
     sed -i "/^shared_preload_libraries/d" "$PG_DATA/postgresql.conf" || true
     echo "shared_preload_libraries = 'pg_stat_statements,pg_cron'" >> "$PG_DATA/postgresql.conf"
-    
-    # Enable SCRAM for password security
-    sed -i "/^password_encryption/d" "$PG_DATA/postgresql.conf" || true
+    sed -i "/^custom./d" "$PG_DATA/postgresql.conf" || true
+    echo "custom.user = '$POSTGRES_USER'" >> "$PG_DATA/postgresql.conf"
+    echo "custom.pass = '$POSTGRES_PASSWORD'" >> "$PG_DATA/postgresql.conf"
+    echo "custom.repl_user = '$REPLICATION_USER'" >> "$PG_DATA/postgresql.conf"
     echo "password_encryption = scram-sha-256" >> "$PG_DATA/postgresql.conf"
-    
-    # Set default database for pg_cron
-    sed -i "/^cron.database_name/d" "$PG_DATA/postgresql.conf" || true
+    echo "log_connections = on" >> "$PG_DATA/postgresql.conf"
+    echo "log_disconnections = on" >> "$PG_DATA/postgresql.conf"
     echo "cron.database_name = '$POSTGRES_DB'" >> "$PG_DATA/postgresql.conf"
-    
     chown postgres:postgres "$PG_DATA/postgresql.conf"
 fi
 
