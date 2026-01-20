@@ -67,6 +67,9 @@ sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
 
+# Reduce log noise when replica is offline
+log_min_messages = warning
+
 num_init_children = 32
 max_pool = 4
 EOF
