@@ -29,9 +29,12 @@ port = 5432
 pcp_port = 9898
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
+backend_weight0 = 1
 backend_flag0 = 'ALLOW_TO_FAILOVER'
+
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
+backend_weight1 = 1
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 
 backend_clustering_mode = 'streaming_replication'
@@ -42,18 +45,20 @@ master_slave_sub_mode = 'stream'
 enable_pool_hba = off
 pool_passwd = ''
 
-# Health Check & Auto Recovery (Using raw strings for passwords to avoid shell escape issues)
+# Health Check & SR Check (Explicit database to fix status -2)
 health_check_period = 10
 health_check_timeout = 30
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$POSTGRES_PASSWORD'
+health_check_database = '$POSTGRES_DB'
 auto_failback = on
 
 sr_check_period = 10
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$POSTGRES_PASSWORD'
+sr_check_database = '$POSTGRES_DB'
 
-num_init_children = 120
+num_init_children = 32
 max_pool = 4
 EOF
 
@@ -71,40 +76,44 @@ PG_DATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
 mkdir -p "$(dirname "$PG_DATA")"
 chown -R postgres:postgres /var/lib/postgresql/data
 
-# --- PRIMARY SETUP ---
+# --- PRIMARY SETUP WITH RESILIENCE ---
 if [ "$NODE_ROLE" = "PRIMARY" ]; then
     (
-        log "Primary: Background maintenance started."
-        until psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select 1" > /dev/null 2>&1; do sleep 3; done
+        # We use a subshell without 'set -e' to handle the transition between temp and final server
+        set +e
+        log "Primary: Background maintenance started (Resilience Mode)."
         
-        log "Primary: Syncing passwords, replication slots, and extensions..."
-        # Use env vars to pass passwords safely to psql
-        export PGPASSWORD_SAFE="$POSTGRES_PASSWORD"
-        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL'
-            -- Update POSTGRES_USER password
-            EXECUTE format('ALTER USER %I WITH PASSWORD %L', current_setting('custom.user'), current_setting('custom.pass'));
-            
-            -- Ensure replication user exists and has correct password
-            DO $$ 
-            BEGIN
-                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = current_setting('custom.repl_user')) THEN
-                    EXECUTE format('CREATE USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
-                ELSE
-                    EXECUTE format('ALTER USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
-                END IF;
-            END $$;
+        while true; do
+            # Wait for server to be responsive
+            if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+                log "Primary: Server is ready. Syncing credentials and extensions..."
+                
+                psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<-'EOSQL' 2>&1
+                    -- Set passwords safely
+                    EXECUTE format('ALTER USER %I WITH PASSWORD %L', current_setting('custom.user'), current_setting('custom.pass'));
+                    DO $$ 
+                    BEGIN
+                        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = current_setting('custom.repl_user')) THEN
+                            EXECUTE format('CREATE USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
+                        ELSE
+                            EXECUTE format('ALTER USER %I WITH REPLICATION PASSWORD %L', current_setting('custom.repl_user'), current_setting('custom.pass'));
+                        END IF;
+                    END $$;
 
-            -- Create replication slot if missing
-            SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
-            WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
-            
-            -- Enable Extensions
-            CREATE EXTENSION IF NOT EXISTS "pg_cron";
-            CREATE EXTENSION IF NOT EXISTS "pg_partman";
+                    -- Setup Replication Slot
+                    SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
+                    WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+                    
+                    -- Setup Extensions
+                    CREATE EXTENSION IF NOT EXISTS "pg_cron";
+                    CREATE EXTENSION IF NOT EXISTS "pg_partman";
 EOSQL
-        
-        log "Primary: Applying failsafe pg_hba.conf..."
-        cat > "$PG_DATA/pg_hba.conf" <<EOF
+
+                if [ $? -eq 0 ]; then
+                    log "Primary: Successfully established HA and Extension configuration."
+                    
+                    # Apply final HBA rules
+                    cat > "$PG_DATA/pg_hba.conf" <<EOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
@@ -116,8 +125,15 @@ host    replication     all             ::/0                    scram-sha-256
 host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 EOF
-        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();"
-        log "Primary: HA and Security configuration confirmed."
+                    psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+                    log "Primary: Final security rules applied. Maintenance thread exiting."
+                    break # Success! Exit the loop.
+                else
+                    warn "Primary: SQL task interrupted (likely server restart), retrying in 5s..."
+                fi
+            fi
+            sleep 5
+        done
     ) &
 fi
 
@@ -133,33 +149,27 @@ if [ "$NODE_ROLE" = "REPLICA" ]; then
         done
         log "Replica: Base backup synced."
     fi
-    # Use safer writing of postgresql.auto.conf
     printf "primary_conninfo = 'host=%s port=5432 user=%s password=%s'\n" "$PRIMARY_HOST" "$REPLICATION_USER" "$POSTGRES_PASSWORD" >> "$PG_DATA/postgresql.auto.conf"
     printf "primary_slot_name = 'replica_slot'\n" >> "$PG_DATA/postgresql.auto.conf"
     chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
 fi
 
-# Shared Config for all DB nodes
+# Shared Config
 if [ -f "$PG_DATA/postgresql.conf" ]; then
-    log "Configuring PostgreSQL libraries and logging..."
+    log "Applying PostgreSQL tuning and background settings..."
     sed -i "s/^logging_collector.*/logging_collector = off/" "$PG_DATA/postgresql.conf" || true
-    
-    # Clean and set shared libraries
     sed -i "/^shared_preload_libraries/d" "$PG_DATA/postgresql.conf" || true
     echo "shared_preload_libraries = 'pg_stat_statements,pg_cron'" >> "$PG_DATA/postgresql.conf"
     
-    # Pass environment variables to Postgres for the background maintenance task
+    # Custom settings for background task
     sed -i "/^custom./d" "$PG_DATA/postgresql.conf" || true
     echo "custom.user = '$POSTGRES_USER'" >> "$PG_DATA/postgresql.conf"
     echo "custom.pass = '$POSTGRES_PASSWORD'" >> "$PG_DATA/postgresql.conf"
     echo "custom.repl_user = '$REPLICATION_USER'" >> "$PG_DATA/postgresql.conf"
     
-    # Security and Debug logging
     echo "password_encryption = scram-sha-256" >> "$PG_DATA/postgresql.conf"
     echo "log_connections = on" >> "$PG_DATA/postgresql.conf"
-    echo "log_disconnections = on" >> "$PG_DATA/postgresql.conf"
     echo "cron.database_name = '$POSTGRES_DB'" >> "$PG_DATA/postgresql.conf"
-    
     chown postgres:postgres "$PG_DATA/postgresql.conf"
 fi
 
