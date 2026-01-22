@@ -148,7 +148,7 @@ log_hostname = off
 log_statement = off
 log_per_node_statement = off
 log_client_messages = off
-log_min_messages = warning
+log_min_messages = error
 
 # Connection pooling
 num_init_children = 32
