@@ -99,6 +99,15 @@ statement_level_load_balance = on
 disable_load_balance_on_write = 'transaction'
 allow_sql_comments = on
 
+# Load balance preferences - force standby for reads
+database_redirect_preference_list = 'postgres:standby'
+app_name_redirect_preference_list = 'psql:standby,pgadmin:standby,dbeaver:standby'
+
+# Allow all functions to be load balanced (empty = all allowed)
+black_function_list = ''
+white_function_list = ''
+black_query_pattern_list = ''
+
 # Authentication: Pass-through to backend
 enable_pool_hba = off
 pool_passwd = ''
