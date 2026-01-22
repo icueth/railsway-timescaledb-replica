@@ -87,7 +87,7 @@ backend_data_directory0 = '/var/lib/postgresql/data'
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_flag1 = 'DISALLOW_TO_FAILOVER'
+backend_flag1 = 'ALLOW_TO_FAILOVER'
 backend_data_directory1 = '/var/lib/postgresql/data'
 
 # Clustering mode
