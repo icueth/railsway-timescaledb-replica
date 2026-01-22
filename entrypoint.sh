@@ -1,23 +1,40 @@
 #!/bin/bash
 # Unified Entrypoint for TimescaleDB HA (PRIMARY, REPLICA, PROXY)
+# Version 2.0 - Enhanced with Auto-Recovery and Resilience
 exec 2>&1
 set -e
 
 # Logging colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 log() { echo -e "${GREEN}[Timescale-$NODE_ROLE]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # Default values for environment variables
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-postgres}"
 REPLICATION_USER="${REPLICATION_USER:-replicator}"
+RECOVERY_CHECK_INTERVAL="${RECOVERY_CHECK_INTERVAL:-30}"
+MAX_RECOVERY_ATTEMPTS="${MAX_RECOVERY_ATTEMPTS:-3}"
 
-log "Starting TimescaleDB HA Entrypoint..."
+log "Starting TimescaleDB HA Entrypoint v2.0..."
 log "Config: USER=$POSTGRES_USER, DB=$POSTGRES_DB, REPL_USER=$REPLICATION_USER, ROLE=$NODE_ROLE"
+
+# Signal handlers for graceful shutdown
+cleanup() {
+    log "Received shutdown signal, cleaning up..."
+    if [ "$NODE_ROLE" = "PROXY" ]; then
+        pkill -TERM pgpool 2>/dev/null || true
+    else
+        pg_ctl -D "$PG_DATA" -m fast stop 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup SIGTERM SIGINT SIGQUIT
 
 # -------------------------------------------------------------------------
 # PROXY ROLE (Pgpool-II 4.7)
@@ -37,6 +54,7 @@ if [ "$NODE_ROLE" = "PROXY" ]; then
     
     cat > "$PGPOOL_CONF" <<EOF
 # Pgpool-II 4.7 Configuration for TimescaleDB HA
+# Enhanced with Auto-Failback and Better Recovery
 
 listen_addresses = '*'
 port = 5432
@@ -51,13 +69,13 @@ pcp_socket_dir = '/var/run/pgpool'
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
 backend_weight0 = 1
-backend_flag0 = 'ALLOW_TO_FAILOVER'
+backend_flag0 = 'ALLOW_TO_FAILOVER,ALWAYS_PRIMARY'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
 backend_hostname1 = '$REPLICA_HOST'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_flag1 = 'ALLOW_TO_FAILOVER'
+backend_flag1 = 'ALLOW_TO_FAILOVER,DISALLOW_TO_FAILOVER_AS_PRIMARY'
 backend_data_directory1 = '/var/lib/postgresql/data'
 
 # Clustering mode
@@ -74,23 +92,31 @@ enable_pool_hba = off
 pool_passwd = ''
 allow_clear_text_frontend_auth = on
 
-# Health Check
-health_check_period = 10
-health_check_timeout = 30
+# Health Check - More aggressive recovery
+health_check_period = 5
+health_check_timeout = 20
 health_check_user = '$POSTGRES_USER'
 health_check_password = '$ESCAPED_PASSWORD'
 health_check_database = '$POSTGRES_DB'
-health_check_max_retries = 3
-health_check_retry_delay = 1
+health_check_max_retries = 5
+health_check_retry_delay = 2
+connect_timeout = 10000
 
 # Auto failback when replica comes back online
 auto_failback = on
+auto_failback_interval = 30
+
+# Failover behavior
+failover_on_backend_error = off
+failover_on_backend_shutdown = off
+detach_false_primary = on
 
 # Streaming Replication Check
-sr_check_period = 10
+sr_check_period = 5
 sr_check_user = '$POSTGRES_USER'
 sr_check_password = '$ESCAPED_PASSWORD'
 sr_check_database = '$POSTGRES_DB'
+delay_threshold = 10000000
 
 # Logging
 log_destination = 'stderr'
@@ -166,9 +192,21 @@ BEGIN
     END IF;
 END \$\$;
 
--- Replication Slot
-SELECT * FROM pg_create_physical_replication_slot('replica_slot') 
-WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot');
+-- Replication Slot (with auto-cleanup for stale slots)
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replica_slot') THEN
+        PERFORM pg_create_physical_replication_slot('replica_slot');
+    END IF;
+END \$\$;
+
+-- Configure for better replication
+ALTER SYSTEM SET wal_keep_size = '1GB';
+ALTER SYSTEM SET max_replication_slots = 4;
+ALTER SYSTEM SET max_wal_senders = 4;
+ALTER SYSTEM SET wal_sender_timeout = '60s';
+ALTER SYSTEM SET wal_level = 'replica';
+SELECT pg_reload_conf();
 EOSQL
 
                 if [ $? -eq 0 ]; then
@@ -195,31 +233,151 @@ EOF
             fi
             sleep 5
         done
+        
+        # Continuous replication slot monitoring
+        log "Primary: Starting replication slot monitor..."
+        while true; do
+            sleep 60
+            # Log replication status
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+                SELECT slot_name, active, restart_lsn, 
+                       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
+                FROM pg_replication_slots 
+                WHERE slot_type = 'physical';" 2>/dev/null | grep -v "^$" | head -5 || true
+        done
     ) &
 fi
 
-# --- REPLICA SETUP ---
+# --- REPLICA SETUP WITH AUTO-RECOVERY ---
 if [ "$NODE_ROLE" = "REPLICA" ]; then
-    log "Replica: Initializing sync logic..."
-    if [ ! -s "$PG_DATA/PG_VERSION" ]; then
-        log "Replica: Cloning data from $PRIMARY_HOST..."
-        until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do sleep 5; done
-        rm -rf "$PG_DATA"/*
-        until PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup -h "$PRIMARY_HOST" -D "$PG_DATA" -U "$REPLICATION_USER" -v -R --slot=replica_slot; do
-            warn "Waiting for primary to be ready for backup..."
+    log "Replica: Initializing sync logic with auto-recovery..."
+    
+    # Function to perform full sync from primary
+    perform_full_sync() {
+        log "Replica: Performing full sync from $PRIMARY_HOST..."
+        
+        # Wait for primary
+        until pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; do 
+            warn "Replica: Waiting for primary to be ready..."
             sleep 5
         done
-        log "Replica: Sync complete."
+        
+        # Stop PostgreSQL if running
+        pg_ctl -D "$PG_DATA" -m immediate stop 2>/dev/null || true
+        
+        # Clean up data directory
+        rm -rf "$PG_DATA"/*
+        
+        # Perform base backup with retries
+        local attempts=0
+        while [ $attempts -lt $MAX_RECOVERY_ATTEMPTS ]; do
+            log "Replica: Base backup attempt $((attempts+1))/$MAX_RECOVERY_ATTEMPTS..."
+            if PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup \
+                -h "$PRIMARY_HOST" \
+                -D "$PG_DATA" \
+                -U "$REPLICATION_USER" \
+                -v -R -P \
+                --slot=replica_slot \
+                --checkpoint=fast \
+                --wal-method=stream 2>&1; then
+                log "Replica: Base backup completed successfully."
+                return 0
+            fi
+            
+            warn "Replica: Base backup failed, retrying in 10s..."
+            attempts=$((attempts+1))
+            sleep 10
+        done
+        
+        error "Replica: Failed to complete base backup after $MAX_RECOVERY_ATTEMPTS attempts."
+        return 1
+    }
+    
+    # Initial sync
+    if [ ! -s "$PG_DATA/PG_VERSION" ]; then
+        log "Replica: No data found, performing initial sync..."
+        perform_full_sync
     fi
     
-    # Update postgresql.auto.conf (append/update, don't overwrite)
+    # Update postgresql.auto.conf
     ESCAPED_PWD=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
     
     sed -i '/^primary_conninfo/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
     sed -i '/^primary_slot_name/d' "$PG_DATA/postgresql.auto.conf" 2>/dev/null || true
-    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD'" >> "$PG_DATA/postgresql.auto.conf"
+    echo "primary_conninfo = 'host=$PRIMARY_HOST port=5432 user=$REPLICATION_USER password=$ESCAPED_PWD application_name=replica1'" >> "$PG_DATA/postgresql.auto.conf"
     echo "primary_slot_name = 'replica_slot'" >> "$PG_DATA/postgresql.auto.conf"
-    chown postgres:postgres "$PG_DATA/postgresql.auto.conf"
+    
+    # Ensure standby.signal exists
+    touch "$PG_DATA/standby.signal"
+    chown postgres:postgres "$PG_DATA/postgresql.auto.conf" "$PG_DATA/standby.signal"
+    
+    # Background recovery monitor
+    (
+        set +e
+        log "Replica: Starting recovery monitor..."
+        sleep 30  # Wait for PostgreSQL to start
+        
+        local consecutive_failures=0
+        
+        while true; do
+            sleep "$RECOVERY_CHECK_INTERVAL"
+            
+            # Check if PostgreSQL is running
+            if ! pg_isready -h localhost -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
+                warn "Replica: PostgreSQL not responding..."
+                consecutive_failures=$((consecutive_failures+1))
+            # Check replication status
+            elif ! psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+                "SELECT CASE WHEN pg_is_in_recovery() THEN 'OK' ELSE 'NOT_REPLICA' END;" 2>/dev/null | grep -q "OK"; then
+                warn "Replica: Not in recovery mode..."
+                consecutive_failures=$((consecutive_failures+1))
+            # Check WAL receiver status
+            elif ! psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+                "SELECT status FROM pg_stat_wal_receiver;" 2>/dev/null | grep -qE "streaming|catchup"; then
+                warn "Replica: WAL receiver not streaming..."
+                
+                # Try to check if it's just a temporary disconnect
+                if psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+                    "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q "t"; then
+                    # Still in recovery mode, might reconnect
+                    log "Replica: Still in recovery mode, WAL receiver may reconnect..."
+                    consecutive_failures=$((consecutive_failures+1))
+                else
+                    consecutive_failures=$((consecutive_failures+1))
+                fi
+            else
+                # Healthy - log replication lag
+                LAG=$(psql -h localhost -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+                    "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::int, 0);" 2>/dev/null || echo "0")
+                
+                if [ "$consecutive_failures" -gt 0 ]; then
+                    log "Replica: Recovered! Replication lag: ${LAG}s"
+                fi
+                consecutive_failures=0
+            fi
+            
+            # If too many consecutive failures, attempt recovery
+            if [ "$consecutive_failures" -ge 5 ]; then
+                error "Replica: Too many consecutive failures ($consecutive_failures), initiating recovery..."
+                
+                # Check if primary is available
+                if pg_isready -h "$PRIMARY_HOST" -p 5432 -U "$POSTGRES_USER" > /dev/null 2>&1; then
+                    log "Replica: Primary is available, attempting full re-sync..."
+                    perform_full_sync
+                    
+                    if [ $? -eq 0 ]; then
+                        log "Replica: Re-sync completed, restarting PostgreSQL..."
+                        # Don't restart here - let the main process handle it
+                        consecutive_failures=0
+                        # Signal main process to restart
+                        kill -HUP 1 2>/dev/null || true
+                    fi
+                else
+                    warn "Replica: Primary not available, will retry later..."
+                fi
+            fi
+        done
+    ) &
 fi
 
 # Shared Configuration Fixes (for PRIMARY and REPLICA)
@@ -228,6 +386,22 @@ if [ -f "$PG_DATA/postgresql.conf" ]; then
     sed -i "s/^logging_collector.*/logging_collector = off/" "$PG_DATA/postgresql.conf" || true
     sed -i "/^password_encryption/d" "$PG_DATA/postgresql.conf" || true
     echo "password_encryption = scram-sha-256" >> "$PG_DATA/postgresql.conf"
+    
+    # Enhanced replication settings for replica
+    if [ "$NODE_ROLE" = "REPLICA" ]; then
+        sed -i "/^hot_standby/d" "$PG_DATA/postgresql.conf" || true
+        sed -i "/^hot_standby_feedback/d" "$PG_DATA/postgresql.conf" || true
+        sed -i "/^wal_receiver_timeout/d" "$PG_DATA/postgresql.conf" || true
+        sed -i "/^wal_retrieve_retry_interval/d" "$PG_DATA/postgresql.conf" || true
+        cat >> "$PG_DATA/postgresql.conf" <<EOF
+
+# Replica-specific settings
+hot_standby = on
+hot_standby_feedback = on
+wal_receiver_timeout = 60s
+wal_retrieve_retry_interval = 5s
+EOF
+    fi
     
     # TimescaleDB tuning
     if command -v timescaledb-tune &> /dev/null; then

@@ -1,5 +1,6 @@
 # Multi-role Dockerfile for TimescaleDB HA
 # Supports PRIMARY, REPLICA, and PROXY roles via NODE_ROLE environment variable
+# Version 2.0 - Enhanced with better recovery support
 
 # Stage 1: Build Pgpool 4.7 from source
 FROM alpine:3.20 AS pgpool-builder
@@ -36,7 +37,8 @@ RUN apk add --no-cache \
     curl \
     libpq \
     openssl \
-    procps
+    procps \
+    postgresql17-client
 
 # Create Pgpool directories
 RUN mkdir -p /var/run/pgpool /var/log/pgpool /etc/pgpool && \
@@ -57,8 +59,10 @@ ENV TS_TUNE_CORES=2
 ENV REPLICATION_USER=replicator
 ENV NODE_ROLE=PRIMARY
 ENV TZ=Asia/Bangkok
+ENV RECOVERY_CHECK_INTERVAL=30
+ENV MAX_RECOVERY_ATTEMPTS=3
 
-# Healthcheck
-HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
+# Healthcheck with better intervals
+HEALTHCHECK --interval=15s --timeout=10s --retries=3 --start-period=30s CMD /usr/local/bin/healthcheck.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-custom.sh"]

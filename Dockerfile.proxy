@@ -18,8 +18,8 @@ COPY healthcheck-proxy.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/entrypoint-custom.sh /usr/local/bin/healthcheck.sh
 
 # Create pgpool directories
-RUN mkdir -p /var/run/pgpool /var/log/pgpool && \
-    chown -R nobody:nogroup /var/run/pgpool /var/log/pgpool
+RUN mkdir -p /var/run/pgpool /var/log/pgpool /etc/pgpool2 && \
+    chown -R nobody:nogroup /var/run/pgpool /var/log/pgpool /etc/pgpool2
 
 # Set environment defaults
 ENV POSTGRES_DB=postgres
@@ -28,7 +28,9 @@ ENV REPLICATION_USER=replicator
 ENV NODE_ROLE=PROXY
 ENV TZ=Asia/Bangkok
 
-# Healthcheck
-HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD /usr/local/bin/healthcheck.sh
+# Healthcheck with better intervals
+HEALTHCHECK --interval=15s --timeout=10s --retries=3 --start-period=30s CMD /usr/local/bin/healthcheck.sh
+
+EXPOSE 5432 9898
 
 ENTRYPOINT ["/usr/local/bin/entrypoint-custom.sh"]
