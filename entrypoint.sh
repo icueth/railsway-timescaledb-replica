@@ -96,7 +96,7 @@ load_balance_mode = on
 
 # Session handling for TimescaleDB/pgx compatibility
 statement_level_load_balance = on
-disable_load_balance_on_write = 'transaction'
+disable_load_balance_on_write = 'off'
 allow_sql_comments = on
 
 # Load balance preferences - force standby for reads
