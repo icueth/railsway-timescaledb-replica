@@ -80,7 +80,7 @@ pcp_socket_dir = '/var/run/pgpool'
 # Backend nodes
 backend_hostname0 = '$PRIMARY_HOST'
 backend_port0 = 5432
-backend_weight0 = 0
+backend_weight0 = 1
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 backend_data_directory0 = '/var/lib/postgresql/data'
 
